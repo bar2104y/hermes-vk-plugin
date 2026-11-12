@@ -59,6 +59,8 @@ VK_API_VERSION = "5.199"
 VK_API_BASE = "https://api.vk.com/method/"
 LONG_POLL_TIMEOUT = 25  # seconds — VK server will hold the connection
 LONG_POLL_RECONNECT_DELAY = 3  # seconds before reconnecting on error
+POLL_STALL_CHECK_INTERVAL = 30  # seconds between watchdog checks
+POLL_STALL_THRESHOLD = 90  # no poll response for this long → loop is dead, restart it
 MAX_MESSAGE_LENGTH = 4096  # VK message limit
 
 # VK message flags
@@ -108,6 +110,13 @@ class VKAdapter(BasePlatformAdapter):
         self._ts: Optional[str] = None
         self._session: Optional[aiohttp.ClientSession] = None
         self._poll_task: Optional[asyncio.Task] = None
+        self._consumer_task: Optional[asyncio.Task] = None
+        self._watchdog_task: Optional[asyncio.Task] = None
+        # Liveness: last time the poll loop completed a request or (re)initialised
+        self._last_poll_activity: float = 0.0
+        # Decouples slow message processing (LLM calls can take minutes)
+        # from the poll loop, so the watchdog only measures HTTP round trips
+        self._updates_queue: Optional[asyncio.Queue] = None
 
         # Rate limiting
         self._last_api_call: float = 0
@@ -167,6 +176,9 @@ class VKAdapter(BasePlatformAdapter):
             **(params or {}),
         }
 
+        if self._session is None or self._session.closed:
+            self._session = await self._new_session()
+
         try:
             async with self._session.post(url, data=payload, timeout=aiohttp.ClientTimeout(total=30)) as resp:
                 data = await resp.json()
@@ -188,6 +200,20 @@ class VKAdapter(BasePlatformAdapter):
             )
 
         return data
+
+    async def _new_session(self) -> aiohttp.ClientSession:
+        """Create an HTTP session (IPv4 only — VK doesn't respond over IPv6)."""
+        import socket
+        connector = aiohttp.TCPConnector(family=socket.AF_INET)
+        return aiohttp.ClientSession(connector=connector)
+
+    async def _close_session(self) -> None:
+        if self._session:
+            try:
+                await self._session.close()
+            except Exception:
+                pass
+            self._session = None
 
     async def _get_long_poll_server(self) -> bool:
         """Get Long Poll server details from VK API.
@@ -253,59 +279,142 @@ class VKAdapter(BasePlatformAdapter):
 
     # ── Long Poll loop ─────────────────────────────────────────────────
 
+    async def _consumer_loop(self) -> None:
+        """Process queued Long Poll updates.
+
+        Runs separately from the poll loop because handling a message
+        (LLM call + reply) can take minutes; inlining it in the poll
+        loop would look like a stall to the watchdog.
+        """
+        while self._running:
+            try:
+                update = await self._updates_queue.get()
+            except asyncio.CancelledError:
+                return
+            try:
+                await self._process_update(update)
+            except Exception:
+                # One bad event must not kill the consumer
+                logger.exception("Failed to process VK update")
+
     async def _poll_loop(self) -> None:
         """Main Long Poll loop — receives events from VK.
 
         Uses groups.getLongPollServer which returns events in
         Callback API format: {"type": "message_new", "object": {...}}
+
+        Owns its own HTTP session: if this task is cancelled (stalled
+        loop, dead connection) all of its TCP connections die with it.
         """
-        while self._running:
-            if not self._server or not self._key or not self._ts:
-                logger.info("Re-initializing Long Poll server...")
-                if not await self._get_long_poll_server():
+        session = await self._new_session()
+        # Register the session before the first API call so the watchdog
+        # and disconnect() can see it
+        await self._close_session()
+        self._session = session
+        self._last_poll_activity = time.monotonic()
+
+        try:
+            while self._running:
+                if not self._server or not self._key or not self._ts:
+                    logger.info("Re-initializing Long Poll server...")
+                    if not await self._get_long_poll_server():
+                        self._last_poll_activity = time.monotonic()
+                        await asyncio.sleep(LONG_POLL_RECONNECT_DELAY)
+                        continue
+
+                url = f"{self._server}?act=a_check&key={self._key}&ts={self._ts}&wait={LONG_POLL_TIMEOUT}"
+
+                # sock_connect covers the case where TCP SYNs go into the
+                # void (half-open socket after a route/tunnel change): with
+                # only `total`, aiohttp waits forever on connect and the
+                # kernel's TCP retransmission timeout is ~15+ minutes
+                try:
+                    async with session.get(
+                        url,
+                        timeout=aiohttp.ClientTimeout(
+                            total=LONG_POLL_TIMEOUT + 10,
+                            sock_connect=10,
+                        ),
+                    ) as resp:
+                        data = await resp.json()
+                except asyncio.TimeoutError:
+                    # Normal timeout — just retry
+                    self._last_poll_activity = time.monotonic()
+                    continue
+                except (aiohttp.ClientError, OSError) as e:
+                    logger.warning("Long Poll connection error: %s", e)
+                    self._last_poll_activity = time.monotonic()
+                    await asyncio.sleep(LONG_POLL_RECONNECT_DELAY)
+                    continue
+                except Exception as e:
+                    logger.warning("Long Poll unexpected error: %s", e)
+                    self._last_poll_activity = time.monotonic()
                     await asyncio.sleep(LONG_POLL_RECONNECT_DELAY)
                     continue
 
-            url = f"{self._server}?act=a_check&key={self._key}&ts={self._ts}&wait={LONG_POLL_TIMEOUT}"
+                # Check for VK-level error (e.g. ts expired)
+                if "error" in data:
+                    err = data["error"]
+                    logger.warning("Long Poll server error: %s", err)
+                    self._server = None
+                    self._key = None
+                    self._ts = None
+                    self._last_poll_activity = time.monotonic()
+                    await asyncio.sleep(LONG_POLL_RECONNECT_DELAY)
+                    continue
 
-            try:
-                async with self._session.get(
-                    url, timeout=aiohttp.ClientTimeout(total=LONG_POLL_TIMEOUT + 10)
-                ) as resp:
-                    data = await resp.json()
-            except asyncio.TimeoutError:
-                # Normal timeout — just retry
-                continue
-            except aiohttp.ClientError as e:
-                logger.warning("Long Poll connection error: %s", e)
-                await asyncio.sleep(LONG_POLL_RECONNECT_DELAY)
-                continue
-            except Exception as e:
-                logger.warning("Long Poll unexpected error: %s", e)
-                await asyncio.sleep(LONG_POLL_RECONNECT_DELAY)
-                continue
+                # Update ts
+                new_ts = data.get("ts")
+                if new_ts:
+                    self._ts = new_ts
+                self._last_poll_activity = time.monotonic()
 
-            # Check for VK-level error (e.g. ts expired)
-            if "error" in data:
-                err = data["error"]
-                logger.warning("Long Poll server error: %s", err)
-                self._server = None
-                self._key = None
-                self._ts = None
-                await asyncio.sleep(LONG_POLL_RECONNECT_DELAY)
-                continue
+                # Enqueue updates for the consumer — processing can take
+                # minutes (LLM call) and must not look like a poll stall
+                updates = data.get("updates", [])
+                if updates:
+                    logger.info("Received %d VK Long Poll updates", len(updates))
+                    for update in updates:
+                        await self._updates_queue.put(update)
+        finally:
+            # Close our session — kills the half-open TCP connection
+            await session.close()
 
-            # Update ts
-            new_ts = data.get("ts")
-            if new_ts:
-                self._ts = new_ts
+    async def _poll_watchdog(self) -> None:
+        """Restart the poll loop if it has not completed a poll in
+        POLL_STALL_THRESHOLD seconds.
 
-            # Process updates
-            updates = data.get("updates", [])
-            if updates:
-                logger.info("Received %d VK Long Poll updates", len(updates))
-            for update in updates:
-                await self._process_update(update)
+        Catches the half-open-socket case where a request is stuck in
+        TCP retransmission (aiohttp timeout never fires because the
+        kernel keeps retrying) — a common fate after a tunnel/route
+        change. The loop task is cancelled (its session's sockets die
+        with it) and a fresh loop reconnects from scratch.
+        """
+        while self._running:
+            await asyncio.sleep(POLL_STALL_CHECK_INTERVAL)
+            if not self._running:
+                return
+
+            idle = time.monotonic() - self._last_poll_activity
+            stalled = idle > POLL_STALL_THRESHOLD
+            dead_task = self._poll_task is None or self._poll_task.done()
+
+            if stalled or dead_task:
+                reason = f"stalled {idle:.0f}s" if stalled else "poll task died"
+                logger.warning(
+                    "VK Long Poll watchdog: %s — restarting poll loop", reason
+                )
+                # Cancel the (possibly hung) loop task; its finally
+                # block closes the session and drops all TCP connections
+                if self._poll_task and not self._poll_task.done():
+                    self._poll_task.cancel()
+                    try:
+                        await self._poll_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                self._server = self._key = self._ts = None
+                self._last_poll_activity = time.monotonic()
+                self._poll_task = asyncio.create_task(self._poll_loop())
 
     async def _process_update(self, update) -> None:
         """Process a single Long Poll update.
@@ -505,21 +614,19 @@ class VKAdapter(BasePlatformAdapter):
             )
             return False
 
-        # Create HTTP session with IPv4 only (VK doesn't respond over IPv6 from WSL)
-        import socket
-        connector = aiohttp.TCPConnector(family=socket.AF_INET)
-        self._session = aiohttp.ClientSession(connector=connector)
-
-        # Get Long Poll server
+        # Get Long Poll server (creates the HTTP session)
         if not await self._get_long_poll_server():
-            await self._session.close()
-            self._session = None
+            await self._close_session()
             return False
 
         self._mark_connected()
 
         # Start polling in background
+        self._updates_queue = asyncio.Queue()
+        self._last_poll_activity = time.monotonic()
+        self._consumer_task = asyncio.create_task(self._consumer_loop())
         self._poll_task = asyncio.create_task(self._poll_loop())
+        self._watchdog_task = asyncio.create_task(self._poll_watchdog())
 
         logger.info(
             "VK adapter connected (group_id=%s, dm_policy=%s, group_policy=%s)",
@@ -531,6 +638,14 @@ class VKAdapter(BasePlatformAdapter):
         """Disconnect from VK Bots Long Poll."""
         self._running = False
 
+        if getattr(self, "_watchdog_task", None):
+            self._watchdog_task.cancel()
+            try:
+                await self._watchdog_task
+            except asyncio.CancelledError:
+                pass
+            self._watchdog_task = None
+
         if self._poll_task:
             self._poll_task.cancel()
             try:
@@ -539,9 +654,15 @@ class VKAdapter(BasePlatformAdapter):
                 pass
             self._poll_task = None
 
-        if self._session:
-            await self._session.close()
-            self._session = None
+        if self._consumer_task:
+            self._consumer_task.cancel()
+            try:
+                await self._consumer_task
+            except asyncio.CancelledError:
+                pass
+            self._consumer_task = None
+
+        await self._close_session()
 
         self._mark_disconnected()
         logger.info("VK adapter disconnected")
